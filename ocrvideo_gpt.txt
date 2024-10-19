@@ -1,0 +1,177 @@
+import cv2 
+import numpy as np
+import os
+import csv
+from ultralytics import YOLO
+import easyocr
+from IPython.display import display, Video
+
+# Paths to the models and folder to save images
+LICENSE_MODEL_DETECTION_DIR = 'license_plate_detector.pt'
+COCO_MODEL_DIR = "yolov8n.pt"
+csv_file = 'detected_cars.csv'
+output_video_path = 'output_detected_video.mp4'
+video_path = 'sample.mp4'  # Path to video in the working directory
+
+# Initialize YOLO models
+coco_model = YOLO(COCO_MODEL_DIR)
+license_plate_detector = YOLO(LICENSE_MODEL_DETECTION_DIR)
+
+# Initialize EasyOCR with configuration
+reader = easyocr.Reader(['en'], gpu=True)
+
+# Threshold for detection confidence
+threshold = 0.7
+
+# Vehicle classes to detect (e.g., 2 for car in COCO)
+vehicles = [2]
+
+# Unique car tracking and association with license plates
+tracked_cars = {}
+car_counter = 0
+
+# Function to read license plate using EasyOCR with specific configurations
+def read_license_plate(license_plate_crop):
+    ocr_result = reader.readtext(license_plate_crop, detail=1, 
+                                 allowlist='ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789', 
+                                 rotation_info=[90, 180, 270])
+    
+    if not ocr_result:
+        return None
+    
+    plate_text = []
+    for result in ocr_result:
+        if result[2] >= threshold:  # Confidence score
+            text = result[1].upper()  # Convert to uppercase
+            plate_text.append(text)
+    
+    full_text = "".join(plate_text)
+    clean_text = full_text.replace(" ", "").replace(".", "").replace("-", "")
+    
+    if len(clean_text) >= 9:
+        print(clean_text)
+        return clean_text
+    
+    return None
+
+# Function to merge bounding boxes if necessary based on geometry (aspect ratio)
+def merge_license_plate_bboxes(license_plates):
+    merged_boxes = []
+    for box in license_plates:
+        x1, y1, x2, y2 = box[:4]
+        width = abs(x2 - x1)
+        height = abs(y2 - y1)
+        aspect_ratio = width / height
+        if aspect_ratio < 1:
+            merged_boxes.append(box)
+    
+    return merged_boxes
+
+# Function to track vehicles and associate with license plates
+def model_prediction(frame):
+    global car_counter
+    img = frame.copy()
+    
+    track_results = coco_model.track(img, persist=True)[0]  # Enable YOLO tracking
+    
+    print(len(track_results.boxes))
+    print(track_results.boxes[0].xyxy[0].tolist())
+    # print(track_results.boxes[0].xyxy[1].tolist() error
+    print(track_results.boxes[1].xyxy[0].tolist())
+    print(track_results.boxes.xyxy[0].tolist())
+    print(track_results.boxes.xyxy[1].tolist())
+    print(int(track_results.boxes[0].cls))
+    print(int(track_results.boxes[1].cls))
+    print(int(track_results.boxes[0].id))
+    print(int(track_results.boxes[1].id))
+
+    license_detections = license_plate_detector(img)[0]
+    
+    detected_license_plates = []
+
+    for license_plate in license_detections.boxes.data.tolist():
+        x1, y1, x2, y2, score, class_id = license_plate
+        detected_license_plates.append([x1, y1, x2, y2])
+
+    merged_license_plates = merge_license_plate_bboxes(detected_license_plates)
+    
+    for i in range(len(track_results.boxes)):
+        #x1, y1, x2, y2, score, class_id = detection
+        x1, y1, x2, y2 = map(int, track_results.boxes[i].xyxy[0].tolist())
+        class_id = map(int, track_results.boxes[i].cls)
+        car_id = map(int, track_results.boxes[i].id)
+        if class_id in vehicles:
+            car_id = car_id  # Get unique car_id from tracker
+            if car_id not in tracked_cars:
+                tracked_cars[car_id] = {'plate_text': None}
+                car_counter += 1
+            
+            for plate_box in merged_license_plates:
+                px1, py1, px2, py2 = plate_box
+                if int(px1) > int(x1) and int(px2) < int(x2) and int(py1) > int(y1) and int(py2) < int(y2):
+                    license_plate_crop = img[int(py1):int(py2), int(px1):int(px2), :]
+                    license_plate_text = read_license_plate(license_plate_crop)
+                    
+                    if license_plate_text and tracked_cars[car_id]['plate_text'] is None:
+                        tracked_cars[car_id]['plate_text'] = license_plate_text
+                        cv2.putText(img, license_plate_text, (int(x1), int(y1) - 10), 
+                                    cv2.FONT_HERSHEY_SIMPLEX, 0.9, (0, 255, 0), 2)
+                        cv2.rectangle(img, (int(x1), int(y1)), (int(x2), int(y2)), (0, 0, 255), 2)
+                        cv2.putText(img, f'Car ID: {car_id}', (int(x1), int(y1) - 40), 
+                                    cv2.FONT_HERSHEY_SIMPLEX, 0.9, (0, 255, 0), 2)
+    
+    return img
+
+# Function to save detected cars' data to CSV
+def save_to_csv(car_data):
+    with open(csv_file, mode='a', newline='') as file:
+        writer = csv.writer(file)
+        for car_id, data in car_data.items():
+            writer.writerow([car_id, data['plate_text']])
+
+def main():
+    # Open video file from working directory
+    cap = cv2.VideoCapture(video_path)
+    
+    if not cap.isOpened():
+        print("Error: Could not open video source.")
+        return
+    
+    # Get video properties for saving the output video
+    frame_width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+    frame_height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+    fps = int(cap.get(cv2.CAP_PROP_FPS))
+    
+    # Define the codec and create VideoWriter object to save the output
+    fourcc = cv2.VideoWriter_fourcc(*'mp4v')  # Codec for mp4
+    out = cv2.VideoWriter(output_video_path, fourcc, fps, (frame_width, frame_height))
+    
+    while True:
+        ret, frame = cap.read()
+        
+        if not ret:
+            print("End of video.")
+            break
+        
+        # Perform prediction and get the annotated frame
+        annotated_frame = model_prediction(frame)
+        
+        # Write the frame to the output video
+        out.write(annotated_frame)
+
+    # Save car details to CSV at the end
+    save_to_csv(tracked_cars)
+    
+    cap.release()
+    out.release()
+
+if __name__ == "__main__":
+    if not os.path.exists(csv_file):
+        with open(csv_file, mode='w', newline='') as file:
+            writer = csv.writer(file)
+            writer.writerow(["Car_ID", "License_Plate_Text"])
+    
+    main()
+
+# After video processing, display the saved video
+display(Video(output_video_path, embed=True))
